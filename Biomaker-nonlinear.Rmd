@@ -1,0 +1,486 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(readxl)
+library(gdata)
+library(openxlsx)
+library(ggpubr)
+library(rstatix)
+library(plyr)
+library(dplyr)
+
+data <- read.xlsx("/Users/cristochow/Desktop/daily_work/task_18/genes.fpkm.anno.xlsx")
+  
+data_linear <- data %>%
+  dplyr::select(-Product)
+```
+
+
+
+```{r}
+# Remove genes that are 0 at all time points, but keep the GeneID column
+data_linear <- data_linear %>%
+  rowwise() %>%
+  filter(any(c_across(-GeneID) != 0)) %>%
+  ungroup()
+
+# Set the row names as GeneID and keep the GeneID column intact
+data_linear <- data_linear %>%
+  mutate(GeneID = GeneID)  # Keep GeneID as a separate column
+
+time_points <- as.numeric(gsub("AV-([0-9]+)w.*", "\\1", colnames(data_linear)[-1]))  # Extract week numbers
+```
+
+
+```{r}
+cor_data <- 
+  seq_len(nrow(data_linear)) %>%
+  purrr::map(function(i) {
+    value <- as.numeric(unlist(data_linear[i, -1]))  # Exclude GeneID column when computing correlation
+    cor_result <- cor.test(value, time_points, method = "spearman", exact = FALSE)
+    data.frame(
+      variable_id = data_linear$GeneID[i],  # Use GeneID as variable_id
+      cor_p = cor_result$p.value,
+      spearman_cor = cor_result$estimate
+    )
+  }) %>%
+  dplyr::bind_rows() %>%
+  as.data.frame()
+```
+
+
+
+```{r}
+cor_data$cor_p_adjust <- p.adjust(cor_data$cor_p, method = "fdr")
+
+cor_data <- cor_data %>%
+  filter(!is.na(cor_p) & !is.na(spearman_cor))
+
+```
+
+
+
+```{r}
+# Step 1: Filter significant correlations
+cor_data <- cor_data %>%
+  mutate(log_p = -log10(cor_p_adjust),  # Calculate the -log10(p-value) for the y-axis
+         significance = ifelse(cor_p_adjust < 0.05, "Significant", "Not Significant"))  # Flag significant changes
+
+
+
+write.csv(cor_data, "correlation_results.csv", row.names = FALSE)
+
+
+# Step 2: Create the Volcano Plot
+ggplot(cor_data, aes(x = spearman_cor, y = log_p)) +
+  geom_point(aes(color = significance, size = log_p), alpha = 0.7) +  # Point size & color adjusted
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", size = 0.8) +  # Horizontal significance line (bold and red)
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 0.8) +  # Single vertical line at 0 (bold and blue)
+  theme_classic() +
+  labs(
+    x = "Spearman Correlation",
+    y = "-log10(P-value)",
+    title = "Enhanced Volcano Plot for Correlation with Aging",
+    color = "Significance Level",
+    size = "-log10(p-value)"
+  ) +
+  scale_color_manual(values = c("Significant" = "orange", "Not Significant" = "grey70")) +
+  scale_size_continuous(range = c(2, 5)) +  # Adjust size to make significant points larger
+  theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  ) +
+  geom_text(data = cor_data %>% filter(log_p > 3 & abs(spearman_cor) > 0.2),
+            aes(label = variable_id), hjust = 1.2, vjust = 1.2, size = 3, color = "black", check_overlap = TRUE)
+```
+
+
+
+#nonlinear heatmap
+```{r}
+#nonlinear
+library(pheatmap)
+data_nonlinear <- data %>%
+  dplyr::select(-Product)
+
+# Remove genes that are 0 at all time points
+data_nonlinear <- data_nonlinear %>%
+  rowwise() %>%
+  filter(any(c_across(-GeneID) != 0)) %>%
+  ungroup()
+
+# Define the baseline group and other age stages
+baseline_cols <- grep("AV-6w", colnames(data_nonlinear), value = TRUE)
+age_stages <- list(
+  "AV-12w" = grep("AV-12w", colnames(data_nonlinear), value = TRUE),
+  "AV-24w" = grep("AV-24w", colnames(data_nonlinear), value = TRUE),
+  "AV-36w" = grep("AV-36w", colnames(data_nonlinear), value = TRUE),
+  "AV-48w" = grep("AV-48w", colnames(data_nonlinear), value = TRUE),
+  "AV-56w" = grep("AV-56w", colnames(data_nonlinear), value = TRUE),
+  "AV-72w" = grep("AV-72w", colnames(data_nonlinear), value = TRUE)
+)
+
+# Perform Wilcoxon test for each gene and each age stage compared to baseline
+results <- list()
+
+for (age_stage in names(age_stages)) {
+  stage_cols <- age_stages[[age_stage]]
+  stage_results <- data.frame(GeneID = data_nonlinear$GeneID, P_Value = NA, Z_Score = NA)
+  
+  for (i in 1:nrow(data_nonlinear)) {
+    baseline_values <- as.numeric(unlist(data_nonlinear[i, baseline_cols]))
+    stage_values <- as.numeric(unlist(data_nonlinear[i, stage_cols]))
+    
+    # Remove NA values from baseline and stage values
+    baseline_values <- baseline_values[!is.na(baseline_values)]
+    stage_values <- stage_values[!is.na(stage_values)]
+    
+    # Perform Wilcoxon test with exact p-value computation turned off due to ties
+    if (length(stage_values) > 0 && length(baseline_values) > 0) {
+      wilcox_test <- wilcox.test(stage_values, baseline_values, paired = FALSE, exact = FALSE)
+      stage_results$P_Value[i] <- wilcox_test$p.value
+      
+      # Calculate z-score
+      combined_values <- c(baseline_values, stage_values)
+      if (sd(combined_values) != 0) {
+        stage_results$Z_Score[i] <- (mean(stage_values) - mean(baseline_values)) / sd(combined_values)
+      } else {
+        stage_results$Z_Score[i] <- NA
+      }
+    }
+  }
+  
+  # Exclude results with p-value >= 0.05
+  stage_results <- stage_results %>% filter(P_Value < 0.05)
+  
+  # Store results for the current age stage
+  results[[age_stage]] <- stage_results
+}
+library(rlist)
+list.save(results, 'list.rdata')
+
+# Combine all z-scores into one dataframe for clustering and plotting
+z_scores_combined <- do.call(cbind, lapply(results, function(x) {
+  if (nrow(x) > 0) {
+    x$Z_Score
+  } else {
+    rep(NA, nrow(data_nonlinear))
+  }
+}))
+
+# Explicitly set the column order
+desired_order <- c('AV-12w', 'AV-24w', 'AV-36w', 'AV-48w', 'AV-56w', 'AV-72w')
+z_scores_combined <- z_scores_combined[, desired_order]
+
+# Convert to data frame and assign row names
+z_scores_combined <- as.data.frame(z_scores_combined)
+rownames(z_scores_combined) <- results[[1]]$GeneID[1:nrow(z_scores_combined)]
+
+
+# Prepare data for heatmap
+z_scores_for_heatmap <- as.matrix(z_scores_combined)
+
+# Save to a file with increased dimensions
+png("heatmap_output.png", width = 1600, height = 1200, res = 150)
+
+gplots::heatmap.2(z_scores_for_heatmap,
+                  col = colorRampPalette(c("navy", "white", "red"))(100),
+                  dendrogram = "row",
+                  Rowv = TRUE,
+                  Colv = FALSE,
+                  trace = "none",
+                  density.info = "none",
+                  scale = "row",
+                  key = TRUE,
+                  key.title = NA,
+                  key.xlab = "Z-score",
+                  cexCol = 1.0,
+                  cexRow = 0.5,
+                  margins = c(5, 10),
+                  lhei = c(1, 5),
+                  lwid = c(1, 4),
+                  srtCol = 0)  # Set column labels to horizontal orientation
+
+dev.off()
+
+
+```
+
+
+
+
+
+
+#DE-SWAN
+```{r}
+#devtools::install_github("lehallib/DEswan",build_vignettes = T)
+library("DEswan")
+library(tidyr)
+library(dplyr)
+
+# Transpose the data so that the first column is timepoints and the second column is gene names
+transposed_data <- as.data.frame(t(data_nonlinear[-1]))
+colnames(transposed_data) <- data_nonlinear[[1]]
+transposed_data <- cbind(Timepoint = rownames(transposed_data), transposed_data)
+rownames(transposed_data) <- NULL
+
+# Convert timepoints into digital form
+transposed_data$Timepoint <- as.numeric(gsub(".*-(\\d+)w-.*", "\\1", transposed_data$Timepoint))
+
+x=cor(transposed_data[,1],transposed_data[,-c(1)])
+
+start_time <- Sys.time()
+
+res.DEswan = DEswan(data.df = transposed_data[,1+c(which(colnames(x) %in% colnames(x)[abs(x)>.5]))],
+                    qt = transposed_data$Timepoint,   # Using Timepoint as the quantitative trait
+                    window.center = seq(35, 95, 10),
+                    buckets.size = 20)
+
+end_time <- Sys.time()
+print(end_time - start_time)
+```
+
+
+
+
+```{r}
+head(res.DEswan$p)
+
+head(res.DEswan$coeff)
+```
+
+
+#Reshape DEswan results
+```{r}
+res.DEswan.wide.p=reshape.DEswan(res.DEswan,parameter = 1,factor = "qt")
+head(res.DEswan.wide.p[,1:5])
+```
+
+
+
+#Pvalues adjustment
+```{r}
+res.DEswan.wide.q=q.DEswan(res.DEswan.wide.p,method="BH")
+head(res.DEswan.wide.q[,1:5])
+```
+
+
+
+
+```{r}
+library(reshape2)
+library(RColorBrewer)
+
+res.DEswan.wide.q.signif=nsignif.DEswan(res.DEswan.wide.q)
+toPlot=res.DEswan.wide.q.signif[1:3,]
+x=as.numeric(gsub("X","",colnames(toPlot)))
+plot(1, type = "n", xlim=c(min(x,na.rm=T),max(x,na.rm=T)),ylim=c(0,max(toPlot,na.rm=T)),ylab="# significant",xlab="qt")
+for(i in 1:nrow(toPlot)){
+  lines(x,
+        toPlot[i,],type='l',lwd=i)
+}
+legend("topleft",legend = paste("q<",rownames(toPlot),sep=""),lwd=c(1,2,3))
+
+
+```
+
+
+
+
+```{r}
+res.DEswan.wide.coeff=reshape.DEswan(res.DEswan,parameter = 2,factor = "qt")
+toHeatmap=sign(res.DEswan.wide.coeff[,-1])*-log10(res.DEswan.wide.p[,-1])
+rownames(toHeatmap)<-res.DEswan.wide.coeff$variable
+
+pairs.breaks <- seq(-3, 3, by=0.01)
+mycol <- gplots::colorpanel(n=length(pairs.breaks)-1,low="cyan",mid="black",high="yellow")
+
+# display the colorbar
+# image(z = matrix(1:100, ncol = 1),col = mycol,xaxt = "n",yaxt = "n")
+
+# Prepare data for heatmap output to PNG
+png("windowsheatmap_output.png", width = 1600, height = 1200, res = 150)
+
+# Create heatmap and save to PNG
+gplots::heatmap.2(as.matrix(toHeatmap),
+                  cexRow = 0.1,
+                  cexCol = 0.7,
+                  trace = "none",
+                  dendrogram = "row",
+                  breaks = pairs.breaks,
+                  col = mycol,
+                  Rowv = TRUE,
+                  key = FALSE,
+                  Colv = FALSE,
+                  lhei = c(0.2, 10),
+                  lwid = c(0.2, 3),
+                  srtCol = 0,  # Set horizontal labels for columns
+                  xlab = "Window Centers")
+
+# Close the PNG device to finalize output
+dev.off()
+
+
+
+
+```
+
+
+
+```{r}
+res.DEswan.wide.q.signif = nsignif.DEswan(res.DEswan.wide.q)
+toPlot = res.DEswan.wide.q.signif[1:3,]
+x = as.numeric(gsub("X", "", colnames(toPlot)))
+
+# Set up the plot
+plot(1, type = "n", xlim = c(min(x, na.rm = TRUE), max(x, na.rm = TRUE)), 
+     ylim = c(0, max(toPlot, na.rm = TRUE)), ylab = "No. of significant genes", 
+     xlab = "Timepoint")
+
+# Define colors for the lines
+colors = c("red", "navy", "cyan")
+
+# Plot each line with a different color and highlight the inflection point
+for (i in 1:nrow(toPlot)) {
+  lines(x, toPlot[i, ], type = 'l', lwd = 2, col = colors[i])
+  
+  # Find the inflection point (assuming it's the maximum value for simplicity)
+  inflection_point_index = which.max(toPlot[i, ])
+  inflection_x = x[inflection_point_index]
+  inflection_y = toPlot[i, inflection_point_index]
+  
+  # Highlight the inflection point
+  points(inflection_x, inflection_y, pch = 19, col = colors[i])
+  
+  # Highlight the value at x = 45 if it exists, similar to the inflection point
+  if (45 %in% x) {
+    point_index_45 = which(x == 45)
+    points(45, toPlot[i, point_index_45], pch = 19, col = colors[i])
+  }
+}
+
+# Add a legend with smaller box size
+legend("topleft", legend = paste("q<", rownames(toPlot), sep = ""), lwd = 2, col = colors, 
+       cex = 0.8, bty = "n")
+
+```
+
+
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(reshape2)
+
+# Read in the dataset
+data_cluster <- read.csv("cluster_matric.csv")
+
+# Melt the data to long format for easier plotting with ggplot2
+long_data <- melt(data_cluster, id.vars = "Age", variable.name = "Cluster", value.name = "Value")
+
+# Create scatter plots for each cluster against age and add a linear fit
+ggplot(long_data, aes(x = Age, y = Value, color = Cluster)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  theme_minimal() +
+  labs(title = "Scatter Plots of Age vs Clusters with Linear Fit",
+       x = "Age",
+       y = "Cluster Value")
+
+```
+
+
+#cluster nonlinear heatmap
+```{r}
+library(pheatmap)
+nonlinear_cluster <- read.csv("cluster_matric_raw.csv")
+
+baseline_cols <- grep("^X6", colnames(nonlinear_cluster), value = TRUE)
+age_stages <- list(
+  "12" = grep("^X12", colnames(nonlinear_cluster), value = TRUE),
+  "24" = grep("^X24", colnames(nonlinear_cluster), value = TRUE),
+  "36" = grep("^X36", colnames(nonlinear_cluster), value = TRUE),
+  "48" = grep("^X48", colnames(nonlinear_cluster), value = TRUE),
+  "56" = grep("^X56", colnames(nonlinear_cluster), value = TRUE),
+  "72" = grep("^X72", colnames(nonlinear_cluster), value = TRUE)
+)
+
+results <- list()
+
+# Perform Wilcoxon test and calculate Z-scores without filtering based on p-values
+for (age_stage in names(age_stages)) {
+  stage_cols <- age_stages[[age_stage]]
+  stage_results <- data.frame(Cluster = nonlinear_cluster$Cluster, P_Value = NA, Z_Score = NA)
+
+  for (i in 1:nrow(nonlinear_cluster)) {
+    baseline_values <- as.numeric(unlist(nonlinear_cluster[i, baseline_cols]))
+    stage_values <- as.numeric(unlist(nonlinear_cluster[i, stage_cols]))
+
+    # Remove NA values from baseline and stage values
+    baseline_values <- baseline_values[!is.na(baseline_values)]
+    stage_values <- stage_values[!is.na(stage_values)]
+
+    # Perform Wilcoxon test with exact p-value computation turned off due to ties
+    if (length(stage_values) > 0 && length(baseline_values) > 0) {
+      wilcox_test <- wilcox.test(stage_values, baseline_values, paired = FALSE, exact = FALSE)
+      stage_results$P_Value[i] <- wilcox_test$p.value
+
+      # Calculate z-score
+      combined_values <- c(baseline_values, stage_values)
+      if (sd(combined_values) != 0) {
+        stage_results$Z_Score[i] <- (mean(stage_values) - mean(baseline_values)) / sd(combined_values)
+      } else {
+        stage_results$Z_Score[i] <- NA
+      }
+    }
+  }
+
+  # Store results for the current age stage without filtering p-values
+  results[[age_stage]] <- stage_results
+}
+
+# Combine all Z-scores into one dataframe for clustering and plotting
+z_scores_combined <- do.call(cbind, lapply(results, function(x) x$Z_Score))
+
+# Set column names explicitly for each age stage
+colnames(z_scores_combined) <- names(age_stages)
+
+# Convert to data frame and assign row names to clusters
+z_scores_combined <- as.data.frame(z_scores_combined)
+rownames(z_scores_combined) <- nonlinear_cluster$Cluster
+
+# Prepare data for heatmap
+z_scores_for_heatmap <- as.matrix(z_scores_combined)
+
+
+# Save to a file with increased dimensions and wider heatmap color blocks
+png("heatmap_cluster_wider_blocks.png", width = 2500, height = 1200, res = 150)
+
+gplots::heatmap.2(z_scores_for_heatmap,
+                  col = colorRampPalette(c("navy", "white", "red"))(100),
+                  dendrogram = "row",
+                  Rowv = TRUE,
+                  Colv = FALSE,
+                  trace = "none",
+                  density.info = "none",
+                  scale = "row",
+                  key = TRUE,
+                  key.title = NA,
+                  key.xlab = "Z-score",
+                  cexCol = 1.0,              # Font size of column labels
+                  cexRow = 0.8,              # Font size of row labels
+                  margins = c(5, 10),        # Space around the heatmap
+                  lhei = c(1, 5),            # Relative height of the key and the heatmap
+                  lwid = c(1, 6),            # Relative width to make heatmap wider
+                  srtCol = 0)                # Column labels' orientation
+
+dev.off()
+
+
+```
